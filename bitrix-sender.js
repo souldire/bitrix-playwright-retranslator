@@ -94,7 +94,17 @@ class BitrixSender {
     await this._saveStorageState();
   }
 
+  // Браузер/страница ещё живы? Если упали — пересоздаём с нуля
+  // (сессия восстановится из auth-state.json, пароль нужен только если протух).
+  async _ensureBrowser() {
+    if (this.browser && this.browser.isConnected() && this.page && !this.page.isClosed()) return;
+    console.log('Браузер недоступен, переинициализируем...');
+    await this.close();
+    await this.init();
+  }
+
   async sendMessage({ chatName, message }) {
+    await this._ensureBrowser();
     if (!this.isAuthenticated) {
       await this.login();
     }
