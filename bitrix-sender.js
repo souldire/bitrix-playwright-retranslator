@@ -5,6 +5,10 @@ import fs from 'fs/promises';
 // Позволяет не логиниться паролем при каждом запуске — сессия восстанавливается.
 const STORAGE_STATE_FILE = 'auth-state.json';
 
+// Сколько миллисекунд браузер может простаивать без сообщений, прежде чем закрыться.
+// 0 — не закрывать (живёт постоянно). По умолчанию 5 минут.
+const IDLE_TIMEOUT_MS = Number(process.env.IDLE_TIMEOUT_MS) || 5 * 60 * 1000;
+
 class BitrixSender {
   constructor() {
     this.browser = null;
@@ -103,8 +107,26 @@ class BitrixSender {
     await this.init();
   }
 
+  // Запланировать закрытие браузера после периода простоя.
+  _scheduleIdleClose() {
+    this._cancelIdleClose();
+    if (!IDLE_TIMEOUT_MS || !this.browser) return;
+    this._idleTimer = setTimeout(() => {
+      console.log(`Браузер простаивает ${IDLE_TIMEOUT_MS} мс, закрываем...`);
+      this.close();
+    }, IDLE_TIMEOUT_MS);
+  }
+
+  _cancelIdleClose() {
+    if (this._idleTimer) {
+      clearTimeout(this._idleTimer);
+      this._idleTimer = null;
+    }
+  }
+
   async sendMessage({ chatName, message }) {
     await this._ensureBrowser();
+    this._cancelIdleClose();
     if (!this.isAuthenticated) {
       await this.login();
     }
@@ -129,24 +151,34 @@ class BitrixSender {
       await this.page.keyboard.press('Enter');
 
       // Даём немного времени на очистку поля (признак, что сообщение ушло).
-      // Браузер НЕ закрываем — сессия переиспользуется для следующих сообщений очереди.
       await this.page.waitForTimeout(500);
 
+      // Запускаем таймер простоя — закроет браузер, если сообщений не будет.
+      this._scheduleIdleClose();
       return { success: true, chatName, message };
     } catch (error) {
       // Браузер оставляем открытым (переиспользуем), но сбрасываем флаг авторизации,
       // чтобы при повторной попытке очередь заново проверила/восстановила сессию.
       this.isAuthenticated = false;
+      this._scheduleIdleClose();
       throw new Error(`Ошибка отправки: ${error.message}`);
     }
   }
 
   async close() {
+    this._cancelIdleClose();
     if (this.browser) {
-      await this.browser.close();
+      const b = this.browser;
+      // Обнуляем ссылки синхронно, чтобы параллельный sendMessage увидел null и переинициализировал.
       this.browser = null;
       this.context = null;
       this.page = null;
+      this.isAuthenticated = false;
+      try {
+        await b.close();
+      } catch {
+        // браузер уже мог быть закрыт
+      }
     }
     this.isAuthenticated = false;
   }
