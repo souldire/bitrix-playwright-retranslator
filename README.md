@@ -148,6 +148,12 @@ npm run test:login
 npm run test:auth
 ```
 
+Проверить, жива ли сохранённая сессия (headless, без окон):
+
+```bash
+npm run check:session
+```
+
 Проверить API на параллельных запросах:
 
 ```bash
