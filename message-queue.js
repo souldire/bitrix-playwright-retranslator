@@ -1,6 +1,13 @@
 import fs from 'fs/promises';
 import path from 'path';
 
+// Пауза между попытками, когда не удаётся авторизоваться (капча, неверный пароль,
+// ручной вход не завершён). Повторные попытки без паузы «долбят» форму входа
+// и продлевают капчу на стороне Битрикс24. По умолчанию 10 минут.
+const AUTH_RETRY_DELAY_MS = Number(process.env.AUTH_RETRY_DELAY_MS) || 10 * 60 * 1000;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 class MessageQueue {
   constructor(queueFile = 'queue.json') {
     this.queueFile = queueFile;
@@ -66,11 +73,19 @@ class MessageQueue {
         } catch (error) {
           item.attempts++;
           item.lastError = error.message;
-          
+
           if (item.attempts >= 3) {
             item.status = 'failed';
             console.error(`❌ Сообщение ${item.id} не удалось отправить после 3 попыток`);
           } else {
+            if (error.auth) {
+              // Проблема авторизации: ретраим не сразу, а после паузы.
+              const minutes = Math.round(AUTH_RETRY_DELAY_MS / 60000);
+              console.error(
+                `⚠️ Проблема авторизации. Повторная попытка для ${item.id} через ${minutes} мин`
+              );
+              await sleep(AUTH_RETRY_DELAY_MS);
+            }
             console.error(`⚠️ Ошибка отправки ${item.id}, попытка ${item.attempts}/3`);
           }
         }

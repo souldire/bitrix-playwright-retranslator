@@ -9,12 +9,22 @@ const STORAGE_STATE_FILE = 'auth-state.json';
 // 0 — не закрывать (живёт постоянно). По умолчанию 5 минут.
 const IDLE_TIMEOUT_MS = Number(process.env.IDLE_TIMEOUT_MS) || 5 * 60 * 1000;
 
+// Сколько миллисекунд ждать ручного входа пользователя в видимом браузере,
+// если автоматический вход не удался (капча, неверный пароль). По умолчанию 5 минут.
+const INTERACTIVE_LOGIN_TIMEOUT_MS =
+  Number(process.env.INTERACTIVE_LOGIN_TIMEOUT_MS) || 5 * 60 * 1000;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 class BitrixSender {
   constructor() {
     this.browser = null;
     this.context = null;
     this.page = null;
     this.isAuthenticated = false;
+    // Автоматический вход паролем уже не проходил (капча/ошибка) —
+    // больше не отправляем пароль сами, ждём ручного входа.
+    this._skipPasswordLogin = false;
   }
 
   async init() {
@@ -73,29 +83,182 @@ class BitrixSender {
     }
   }
 
+  // Мы всё ещё на странице входа? (форма видна или URL — страница авторизации)
+  async _isAuthActive() {
+    const onAuthUrl = /[?&]login=yes|\/auth\//.test(this.page.url());
+    const formVisible = await this.page
+      .locator('input[name="USER_LOGIN"]')
+      .isVisible()
+      .catch(() => false);
+    return onAuthUrl || formVisible;
+  }
+
+  async _isCaptchaVisible() {
+    return this.page
+      .locator(
+        'iframe[src*="recaptcha"], .g-recaptcha, img[src*="captcha"], input[name="captcha_word"]'
+      )
+      .first()
+      .isVisible()
+      .catch(() => false);
+  }
+
+  async _isLoginErrorVisible() {
+    // Алерт на странице входа после отправки формы ≈ неверный логин/пароль.
+    return this.page
+      .locator('.alert, .ui-alert, [class*="auth-error"]')
+      .first()
+      .isVisible()
+      .catch(() => false);
+  }
+
+  // Ошибка авторизации: по флагу auth очередь делает длинную паузу перед повтором,
+  // чтобы повторные попытки не «долбили» форму входа и не продлевали капчу.
+  _authError(message) {
+    const error = new Error(message);
+    error.auth = true;
+    return error;
+  }
+
+  _interactiveLoginEnabled() {
+    return process.env.INTERACTIVE_LOGIN?.toLowerCase() !== 'false';
+  }
+
   async login() {
     if (this.isAuthenticated) return;
 
     await this.page.goto(process.env.BITRIX_URL, { waitUntil: 'domcontentloaded' });
 
-    if (await this._isOnLoginPage()) {
-      // Сессии нет или она истекла — логинимся паролем
-      await this.page.fill('input[name="USER_LOGIN"]', process.env.BITRIX_LOGIN);
-      await this.page.fill('input[name="USER_PASSWORD"]', process.env.BITRIX_PASSWORD);
-      await this.page.click('button[type="submit"]');
-
-      // Ждём, пока форма входа исчезнет (значит, вошли)
-      await this.page
-        .waitForSelector('input[name="USER_LOGIN"]', { state: 'hidden', timeout: 20000 })
-        .catch(() => {});
-      console.log('Выполнен вход паролем');
-    } else {
+    if (!(await this._isOnLoginPage())) {
       console.log('Сессия жива, логин паролем не требуется');
+    } else if (this._skipPasswordLogin) {
+      // Раньше автологин уже не проходил (капча/ошибка) — пароль больше
+      // не отправляем, сразу отдаём вход пользователю.
+      if (!this._interactiveLoginEnabled()) {
+        throw this._authError(
+          'Автоматический вход отключён до ручного входа (ранее была капча или ошибка входа)'
+        );
+      }
+      await this._interactiveLogin('Автоматический вход ранее не удался (капча или ошибка)');
+    } else {
+      await this._loginWithPassword();
     }
 
+    this._skipPasswordLogin = false;
     this.isAuthenticated = true;
     // Сохраняем куки для следующих запусков
     await this._saveStorageState();
+  }
+
+  async _loginWithPassword() {
+    await this.page.fill('input[name="USER_LOGIN"]', process.env.BITRIX_LOGIN);
+    await this.page.fill('input[name="USER_PASSWORD"]', process.env.BITRIX_PASSWORD);
+    await this.page.click('button[type="submit"]');
+
+    const failureReason = await this._waitForLoginResult();
+    if (!failureReason) {
+      console.log('Выполнен вход паролем');
+      return;
+    }
+
+    // Вход не удался — пароль повторно не отправляем.
+    this._skipPasswordLogin = true;
+
+    if (!this._interactiveLoginEnabled()) {
+      throw this._authError(`Вход паролем не удался: ${failureReason}`);
+    }
+    await this._interactiveLogin(failureReason);
+  }
+
+  // Ждём итог автологина: либо ушли со страницы входа (успех), либо появилась
+  // капча/ошибка, либо форма так и не исчезла (перехода в портал не было).
+  // Возвращает null при успехе или текстовую причину неудачи.
+  async _waitForLoginResult() {
+    const timeoutMs = 20000;
+    const start = Date.now();
+    let stableSuccessTicks = 0;
+
+    while (Date.now() - start < timeoutMs) {
+      if (await this._isCaptchaVisible()) return 'потребовалась капча';
+      if (await this._isLoginErrorVisible()) return 'ошибка входа (неверный логин или пароль?)';
+
+      if (await this._isAuthActive()) {
+        stableSuccessTicks = 0;
+      } else {
+        // Успех подтверждаем двумя опросами подряд: при перезагрузке формы
+        // после неудачного входа страница может на миг остаться без формы.
+        stableSuccessTicks += 1;
+        if (stableSuccessTicks >= 2) return null;
+      }
+
+      await sleep(500);
+    }
+
+    return 'форма входа не исчезла — перехода в портал не произошло';
+  }
+
+  // Открывает видимый (не headless) браузер, чтобы пользователь вошёл и решил
+  // капчу вручную. После успешного входа сессия сохраняется в auth-state.json,
+  // и дальше бот снова работает по кукам, без пароля.
+  async _interactiveLogin(reason) {
+    const waitMinutes = Math.round(INTERACTIVE_LOGIN_TIMEOUT_MS / 60000);
+    console.warn(`⚠️  ${reason}`);
+    console.warn('Открываю видимый браузер: войди вручную и реши капчу, если она появится.');
+    console.warn(`Жду входа до ${waitMinutes} мин.`);
+
+    // Headless-браузер для ручного входа не подходит — пересоздаём его видимым,
+    // сохранив имеющиеся куки.
+    await this.close();
+
+    const launchOptions = { headless: false };
+    if (process.env.USE_SYSTEM_CHROME?.toLowerCase() === 'true') {
+      launchOptions.channel = 'chrome';
+    }
+    this.browser = await chromium.launch(launchOptions);
+
+    const contextOptions = {};
+    const savedState = await this._loadStorageState();
+    if (savedState) contextOptions.storageState = savedState;
+    this.context = await this.browser.newContext(contextOptions);
+    this.page = await this.context.newPage();
+
+    await this.page.goto(process.env.BITRIX_URL, { waitUntil: 'domcontentloaded' });
+
+    if (await this._isOnLoginPage()) {
+      // Подставляем логин и пароль, но «Войти» не нажимаем:
+      // капчу должен решить и подтвердить вход человек.
+      await this.page
+        .fill('input[name="USER_LOGIN"]', process.env.BITRIX_LOGIN)
+        .catch(() => {});
+      await this.page
+        .fill('input[name="USER_PASSWORD"]', process.env.BITRIX_PASSWORD)
+        .catch(() => {});
+    }
+
+    const start = Date.now();
+    let stableSuccessTicks = 0;
+    while (Date.now() - start < INTERACTIVE_LOGIN_TIMEOUT_MS) {
+      if (!this.browser.isConnected()) {
+        throw this._authError('Видимый браузер закрыт до завершения входа');
+      }
+
+      if (await this._isAuthActive()) {
+        stableSuccessTicks = 0;
+      } else {
+        stableSuccessTicks += 1;
+        if (stableSuccessTicks >= 2) {
+          // Фиксируем сессию сразу, даже если пользователь тут же закроет окно.
+          await this._saveStorageState();
+          console.log('Ручной вход выполнен, сессия обновлена');
+          return;
+        }
+      }
+
+      await sleep(1000);
+    }
+
+    await this.close();
+    throw this._authError(`Ручной вход не выполнен за ${waitMinutes} мин`);
   }
 
   // Браузер/страница ещё живы? Если упали — пересоздаём с нуля

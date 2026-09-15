@@ -6,6 +6,7 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "test:login": "node tests/test-login.js",
+    "test:auth": "node tests/test-auth-detection.js",
     "test:api": "pwsh tests/test-api.ps1"
   },
   "dependencies": {
