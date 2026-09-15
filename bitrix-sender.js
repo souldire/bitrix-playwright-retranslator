@@ -25,6 +25,10 @@ class BitrixSender {
     // Автоматический вход паролем уже не проходил (капча/ошибка) —
     // больше не отправляем пароль сами, ждём ручного входа.
     this._skipPasswordLogin = false;
+    // Видимый браузер ручного входа уже открывали в этом запуске —
+    // сам больше не открываем (только по запросу через /api/auth).
+    this._interactiveTried = false;
+    this._interactivePromise = null;
   }
 
   async init() {
@@ -127,16 +131,25 @@ class BitrixSender {
   async login() {
     if (this.isAuthenticated) return;
 
+    // Идёт ручной вход из другого вызова (например, /api/auth) — ждём его,
+    // а не ломимся в форму параллельно.
+    if (this._interactivePromise) {
+      await this._interactivePromise.catch(() => {});
+      if (this.isAuthenticated) return;
+    }
+
     await this.page.goto(process.env.BITRIX_URL, { waitUntil: 'domcontentloaded' });
 
     if (!(await this._isOnLoginPage())) {
       console.log('Сессия жива, логин паролем не требуется');
     } else if (this._skipPasswordLogin) {
       // Раньше автологин уже не проходил (капча/ошибка) — пароль больше
-      // не отправляем, сразу отдаём вход пользователю.
-      if (!this._interactiveLoginEnabled()) {
+      // не отправляем. Окно ручного входа сами открываем только один раз,
+      // чтобы не мучить пользователя всплывающими браузерами по кругу.
+      if (!this._interactiveLoginEnabled() || this._interactiveTried) {
         throw this._authError(
-          'Автоматический вход отключён до ручного входа (ранее была капча или ошибка входа)'
+          'Автоматический вход отключён до ручного входа. ' +
+            `Открыть окно входа вручную: GET http://localhost:${process.env.PORT || 3456}/api/auth`
         );
       }
       await this._interactiveLogin('Автоматический вход ранее не удался (капча или ошибка)');
@@ -164,8 +177,11 @@ class BitrixSender {
     // Вход не удался — пароль повторно не отправляем.
     this._skipPasswordLogin = true;
 
-    if (!this._interactiveLoginEnabled()) {
-      throw this._authError(`Вход паролем не удался: ${failureReason}`);
+    if (!this._interactiveLoginEnabled() || this._interactiveTried) {
+      throw this._authError(
+        `Вход паролем не удался: ${failureReason}. ` +
+          `Открыть окно ручного входа: GET http://localhost:${process.env.PORT || 3456}/api/auth`
+      );
     }
     await this._interactiveLogin(failureReason);
   }
@@ -197,12 +213,29 @@ class BitrixSender {
     return 'форма входа не исчезла — перехода в портал не произошло';
   }
 
+  // Ручной вход по явному запросу (эндпоинт GET /api/auth): открывает видимый
+  // браузер независимо от того, сколько раз он открывался автоматически.
+  async manualLogin() {
+    return this._interactiveLogin('Ручной вход по запросу');
+  }
+
+  // Гарантирует один незакрытый ручной вход: параллельные вызовы (очередь +
+  // /api/auth) ждут один и тот же браузер, а не открывают несколько.
+  async _interactiveLogin(reason) {
+    if (this._interactivePromise) return this._interactivePromise;
+    this._interactiveTried = true;
+    this._interactivePromise = this._doInteractiveLogin(reason).finally(() => {
+      this._interactivePromise = null;
+    });
+    return this._interactivePromise;
+  }
+
   // Открывает видимый (не headless) браузер, чтобы пользователь вошёл и решил
   // капчу вручную. Сервис сам НЕ решает, когда вход выполнен (на редиректах
   // страницы такой детект ловит ложные срабатывания): он периодически сохраняет
   // куки и ждёт, пока пользователь закроет окно. После закрытия поднимается
   // обычный браузер и по auth-state.json проверяется, что сессия жива.
-  async _interactiveLogin(reason) {
+  async _doInteractiveLogin(reason) {
     const waitMinutes = Math.round(INTERACTIVE_LOGIN_TIMEOUT_MS / 60000);
     console.warn(`⚠️  ${reason}`);
     console.warn('Открываю видимый браузер: войди вручную и реши капчу, если она появится.');
@@ -275,6 +308,8 @@ class BitrixSender {
       );
     }
 
+    this._skipPasswordLogin = false;
+    this.isAuthenticated = true;
     console.log('Ручной вход выполнен, сессия обновлена');
   }
 

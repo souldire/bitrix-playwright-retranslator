@@ -52,6 +52,22 @@ app.get('/api/queue', (req, res) => {
   res.json(queue.getStatus());
 });
 
+// Ручной вход: открывает видимый браузер с формой входа Битрикс24.
+// Нужен, когда автологин упёрся в капчу, а окно ручного входа уже
+// автоматически не открывается (это происходит не чаще одного раза за запуск).
+// Запрос висит, пока окно не закроют (или не истечёт INTERACTIVE_LOGIN_TIMEOUT_MS).
+app.get('/api/auth', async (req, res) => {
+  try {
+    if (sender.isAuthenticated) {
+      return res.json({ success: true, authenticated: true, note: 'Сессия уже жива' });
+    }
+    await sender.manualLogin();
+    res.json({ success: true, authenticated: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
