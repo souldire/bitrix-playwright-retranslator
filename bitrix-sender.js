@@ -185,10 +185,10 @@ class BitrixSender {
       if (await this._isAuthActive()) {
         stableSuccessTicks = 0;
       } else {
-        // Успех подтверждаем двумя опросами подряд: при перезагрузке формы
+        // Успех подтверждаем несколькими опросами подряд: при перезагрузке формы
         // после неудачного входа страница может на миг остаться без формы.
         stableSuccessTicks += 1;
-        if (stableSuccessTicks >= 2) return null;
+        if (stableSuccessTicks >= 3) return null;
       }
 
       await sleep(500);
@@ -198,13 +198,15 @@ class BitrixSender {
   }
 
   // Открывает видимый (не headless) браузер, чтобы пользователь вошёл и решил
-  // капчу вручную. После успешного входа сессия сохраняется в auth-state.json,
-  // и дальше бот снова работает по кукам, без пароля.
+  // капчу вручную. Сервис сам НЕ решает, когда вход выполнен (на редиректах
+  // страницы такой детект ловит ложные срабатывания): он периодически сохраняет
+  // куки и ждёт, пока пользователь закроет окно. После закрытия поднимается
+  // обычный браузер и по auth-state.json проверяется, что сессия жива.
   async _interactiveLogin(reason) {
     const waitMinutes = Math.round(INTERACTIVE_LOGIN_TIMEOUT_MS / 60000);
     console.warn(`⚠️  ${reason}`);
     console.warn('Открываю видимый браузер: войди вручную и реши капчу, если она появится.');
-    console.warn(`Жду входа до ${waitMinutes} мин.`);
+    console.warn(`Закончишь — закрой окно браузера сам. Жду до ${waitMinutes} мин.`);
 
     // Headless-браузер для ручного входа не подходит — пересоздаём его видимым,
     // сохранив имеющиеся куки.
@@ -235,30 +237,50 @@ class BitrixSender {
         .catch(() => {});
     }
 
-    const start = Date.now();
-    let stableSuccessTicks = 0;
-    while (Date.now() - start < INTERACTIVE_LOGIN_TIMEOUT_MS) {
-      if (!this.browser.isConnected()) {
-        throw this._authError('Видимый браузер закрыт до завершения входа');
-      }
+    // Периодически снимаем куки: когда пользователь закроет окно, контекст
+    // станет недоступен, и сохранить сессию будет уже нечем.
+    const snapshotTimer = setInterval(() => {
+      this._saveStorageState();
+    }, 2000);
 
-      if (await this._isAuthActive()) {
-        stableSuccessTicks = 0;
-      } else {
-        stableSuccessTicks += 1;
-        if (stableSuccessTicks >= 2) {
-          // Фиксируем сессию сразу, даже если пользователь тут же закроет окно.
-          await this._saveStorageState();
-          console.log('Ручной вход выполнен, сессия обновлена');
-          return;
-        }
+    let hinted = false;
+    const start = Date.now();
+    while (Date.now() - start < INTERACTIVE_LOGIN_TIMEOUT_MS) {
+      if (!this.browser.isConnected()) break; // пользователь закрыл окно
+
+      if (!hinted && this._isPortalUrl(this.page.url())) {
+        hinted = true;
+        console.log('Похоже, вход выполнен. Закрой окно браузера — сервис продолжит работу.');
       }
 
       await sleep(1000);
     }
 
+    clearInterval(snapshotTimer);
+    const closedByUser = !this.browser.isConnected();
+
+    // Окно закрыто (пользователем или по таймауту). Поднимаем обычный браузер
+    // и проверяем по сохранённым кукам, что сессия действительно жива.
     await this.close();
-    throw this._authError(`Ручной вход не выполнен за ${waitMinutes} мин`);
+    console.log('Проверяю обновлённую сессию...');
+    await this.init();
+
+    await this.page.goto(process.env.BITRIX_URL, { waitUntil: 'domcontentloaded' });
+    if (await this._isOnLoginPage()) {
+      // Сессия не обновилась (окно закрыли без входа) — пароль по-прежнему не шлём.
+      throw this._authError(
+        closedByUser
+          ? 'Окно ручного входа закрыто, но вход не был выполнен'
+          : `Ручной вход не выполнен за ${waitMinutes} мин`
+      );
+    }
+
+    console.log('Ручной вход выполнен, сессия обновлена');
+  }
+
+  // URL ведёт в раздел портала (а не на страницу входа)?
+  _isPortalUrl(url) {
+    return /\/(online|stream|company|crm|contacts|market|settings)\//.test(url);
   }
 
   // Браузер/страница ещё живы? Если упали — пересоздаём с нуля
